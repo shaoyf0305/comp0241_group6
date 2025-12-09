@@ -9,15 +9,41 @@ import glob
 #circle and ellipse--all test cases
 # restriction: 1. not for small objects   2. rely on picture quality
 #designed for task1--optimal
-
+# better at handle noise
 
 # use circle model for circles, use contour for ellipse
 
 # METHOD 3: color, then choose between circle/ellipse
 
-def color_then_circle(image):
+def color_then_circle_or_ellipse(image, center_weight=0.2, auto_scale_margin=20, use_connected_components=True):
+    """
+    Enhanced version using connected components with both circle and ellipse fitting
+    Compares both methods and chooses the one with better coverage
+    
+    Parameters:
+    -----------
+    image : Input image
+    center_weight : float
+        Weight for center penalty (0 to 1). Higher values favor more central shapes.
+    auto_scale_margin : int
+        Pixel margin to add beyond the farthest component point (default: 20 pixels).
+    use_connected_components : bool
+        If True, use connected components analysis to keep all central data points
+    
+    Returns:
+    --------
+    final_mask : numpy array       Binary mask of the detected shape
+    edges : numpy array             Edge detection result (for visualization)
+    shape_type : str                'circle' or 'ellipse' indicating which was chosen
+    """
 
-    # Color threshold, ocean only
+    H, W = image.shape[:2]
+    img_center_x = W / 2
+    img_center_y = H / 2
+    max_distance = np.sqrt(img_center_x**2 + img_center_y**2)  # diagonal distance
+    max_possible_radius = min(H, W) / 2  # Maximum reasonable radius
+
+    # Color threshold, ocean only -- pick blue
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     lower_blue = np.array([85, 40, 40])
     upper_blue = np.array([135, 255, 255])
@@ -28,113 +54,263 @@ def color_then_circle(image):
     ocean_mask = cv2.morphologyEx(ocean_mask, cv2.MORPH_OPEN, kernel, iterations=2)
     ocean_mask = cv2.morphologyEx(ocean_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
-    # Apply Canny edge detection on the color mask
-    edges = cv2.Canny(ocean_mask, 50, 150)
-    
-    # Extract edge points
-    ys, xs = np.where(edges > 0)
-    
-    if len(xs) < 20:
-        print("Insufficient edge points, fallback to color mask only")
-        return ocean_mask
-    
-    points = np.column_stack([xs, ys])
-
-    # RANSAC circle fitting on edge points
-    model = CircleModel()
-    try:
-        circle, inliers = ransac(points, CircleModel, min_samples=3, residual_threshold=2, max_trials=2000)
-        xc, yc, r = circle.params
-        circle_center=[xc,yc]
-    except Exception as e:
-        print(f"Circle fit failed: {e}, fallback to mask")
-        return ocean_mask
+    if use_connected_components:
+        print("  Using connected components analysis...")
         
-    try:
-        # Calculate circle fitting error
-        distances_circle = np.abs(np.sqrt((xs - xc)**2 + (ys - yc)**2) - r)
-        circle_error = np.mean(distances_circle)
+        # First, create a center region mask to focus analysis
+        # Only analyze the central 80% of the image to avoid background
+        center_roi = np.zeros_like(ocean_mask)  # region of interest
+        roi_margin_h = int(H * 0.1)  # 10% margin on top/bottom
+        roi_margin_w = int(W * 0.1)  # 10% margin on left/right
+        center_roi[roi_margin_h:H-roi_margin_h, roi_margin_w:W-roi_margin_w] = 255
         
-    except np.linalg.LinAlgError:
-        circle_error = float('inf')
-    
-
-
-    # FIT ELLIPSE 
-    
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (7,7), 1.5)
-    # Find contours from edges
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    if len(contours) == 0:
-        print("No contours found")
-        return np.zeros_like(gray)
-    
-    # Get largest contour
-    contour = max(contours, key=cv2.contourArea)
-        # Need at least 5 points to fit ellipse
-    if len(contour) < 5:
-        print("Insufficient points for shape fitting")
-        return np.zeros_like(gray)
-    
-    # Squeeze contour to get (N, 2) shape
-    pts = contour.squeeze()
-    if pts.ndim != 2:
-        print("Invalid contour shape")
-        return np.zeros_like(gray)
-    
-    x = pts[:, 0].astype(np.float64)
-    y = pts[:, 1].astype(np.float64)
-
-    try:
-        ellipse = cv2.fitEllipse(contour)
-
-        # Calculate ellipse fitting error (Euclidean distance in pixels)
-        (cx, cy), (MA, ma), angle = ellipse # center, major/minor axis length, rotation angle
-        a = MA / 2
-        b = ma / 2
-        angle_rad = np.deg2rad(angle)
-        ellipse_center=[cx,cy]
-
-        distances_ellipse = []
-        for xi, yi in zip(x, y):
-            xp = xi - cx
-            yp = yi - cy
+        # Apply ROI constraint to ocean mask
+        ocean_mask_roi = cv2.bitwise_and(ocean_mask, center_roi)
+        
+        # Find all connected components in the ROI-constrained ocean mask
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(ocean_mask_roi, connectivity=8)
+        
+        # Filter components: keep those near the image center
+        # This identifies the main globe region(s)
+        central_components = []
+        for i in range(1, num_labels):  # Skip background (label 0)
+            cx, cy = centroids[i]
+            area = stats[i, cv2.CC_STAT_AREA]
             
-            xr = xp * np.cos(angle_rad) + yp * np.sin(angle_rad)
-            yr = -xp * np.sin(angle_rad) + yp * np.cos(angle_rad)
-
-            dist_from_center = np.sqrt(xr**2 + yr**2)
-            theta = np.arctan2(yr, xr)
-            ellipse_radius = (a * b) / np.sqrt((b * np.cos(theta))**2 + (a * np.sin(theta))**2)
-            dist_to_ellipse = np.abs(dist_from_center - ellipse_radius)
-            distances_ellipse.append(dist_to_ellipse)
+            # Distance from image center
+            dist = np.sqrt((cx - img_center_x)**2 + (cy - img_center_y)**2)
+            
+            # Keep components that are:
+            # 1. Reasonably large (not tiny noise)
+            # 2. Near the center of the image
+            if area > 200 and dist < max_distance * 0.5:  # Within 50% of diagonal
+                central_components.append(i)
         
-        ellipse_error = np.mean(distances_ellipse)
+        # Create mask of all central components
+        central_mask = np.zeros_like(ocean_mask)
+        for comp_id in central_components:
+            central_mask[labels == comp_id] = 255
         
-    except Exception as e:
-        print(f"Ellipse fitting failed: {e}, fallback to mask")
-        return ocean_mask
-    
-    # Choose the better fit
-    print(f"  Circle error: {circle_error:.2f}, Ellipse error: {ellipse_error:.2f}")
-    print(f"  Circle Center: {circle_center}, Ellipse center: {ellipse_center}")
-
-    H, W = ocean_mask.shape
-    final_mask = np.zeros_like(ocean_mask)
-    
-    if circle_error > ellipse_error*2 and ellipse_error > 9.5:
-        print("  → Chose ELLIPSE fit")
-        cv2.ellipse(final_mask, ellipse, 255, -1)
-        center = ellipse_center
+        # Extract boundary points from the central components
+        kernel_boundary = np.ones((3, 3), np.uint8)
+        eroded = cv2.erode(central_mask, kernel_boundary, iterations=1)
+        boundary = cv2.subtract(central_mask, eroded)
+        
+        edges = boundary
+        
+        # Use boundary points for shape fitting
+        boundary_ys, boundary_xs = np.where(boundary > 0)
+        
+        print(f"  Total central region pixels: {np.sum(central_mask > 0)}")
+        print(f"  Boundary points: {len(boundary_xs)}")
+        
+        # Use boundary points
+        if len(boundary_xs) > 100:
+            points_xs = boundary_xs
+            points_ys = boundary_ys
+        else:
+            # Fallback: use all central points
+            ys, xs = np.where(central_mask > 0)
+            points_xs = xs
+            points_ys = ys
+            
     else:
-        print("  → Chose CIRCLE fit")
+        # Apply Canny edge detection on the color mask (original method)
+        edges = cv2.Canny(ocean_mask, 80, 180)
+        points_ys, points_xs = np.where(edges > 0)
+        
+        # For non-connected components, use all edge points
+        ys, xs = np.where(edges > 0)
+        central_mask = ocean_mask
+    
+    # Extract points for shape fitting
+    points = np.column_stack([points_xs, points_ys])
+    print(f"  Using {len(points)} points for shape fitting")
+    
+    # Get all interest points for coverage calculation
+    all_ys, all_xs = np.where(central_mask > 0)
+    total_interest_points = len(all_xs)
+    print(f"  Total interest points to cover: {total_interest_points}")
+
+    # ========== FIT CIRCLE ==========
+    print("\n  === FITTING CIRCLE ===")
+    best_circle = None
+    best_circle_coverage = 0
+    n_iterations = 10
+    
+    if use_connected_components and len(points) >= 3:
+        for i in range(n_iterations):
+            try:
+                circle, inliers = ransac(points, CircleModel, min_samples=3, 
+                                        residual_threshold=3, max_trials=2000)
+                xc, yc, r = circle.params
+                
+                # Check if center is within frame boundary
+                if not (0 <= xc < W and 0 <= yc < H):
+                    print(f"  Trial {i+1}: Circle center outside frame, skipping")
+                    continue
+                
+                r = r + auto_scale_margin  # Extend radius a bit
+                
+                # Calculate coverage: how many interest points are inside this circle
+                distances = np.sqrt((all_xs - xc)**2 + (all_ys - yc)**2)
+                points_inside = np.sum(distances <= r)
+                coverage_ratio = points_inside / total_interest_points if total_interest_points > 0 else 0
+                
+                print(f"  Trial {i+1}: center=({xc:.1f}, {yc:.1f}), r={r:.1f}, "
+                      f"coverage={points_inside}/{total_interest_points} ({coverage_ratio:.3f})")
+
+                if coverage_ratio > best_circle_coverage:
+                    best_circle_coverage = coverage_ratio
+                    best_circle = (xc, yc, r)
+                
+            except Exception as e:
+                print(f"  Trial {i+1} failed: {e}")
+                continue
+    else:
+        try:
+            circle, inliers = ransac(points, CircleModel, min_samples=3,
+                                  residual_threshold=3, max_trials=2000)
+            xc, yc, r = circle.params
+            
+            # Check if center is within frame boundary
+            if 0 <= xc < W and 0 <= yc < H:
+                distances = np.sqrt((all_xs - xc)**2 + (all_ys - yc)**2)
+                points_inside = np.sum(distances <= r)
+                best_circle_coverage = points_inside / total_interest_points if total_interest_points > 0 else 0
+                best_circle = (xc, yc, r)
+                print(f"  Circle: center=({xc:.1f}, {yc:.1f}), r={r:.1f}, coverage={best_circle_coverage:.3f}")
+            else:
+                print(f"  Circle center outside frame, skipping")
+        except Exception as e:
+            print(f"  Circle fitting failed: {e}")
+
+    # ========== FIT ELLIPSE ==========
+    print("\n  === FITTING ELLIPSE ===")
+    best_ellipse = None
+    best_ellipse_coverage = 0
+    
+    if len(points) >= 5:
+        for i in range(n_iterations):
+            try:
+                # Sample points for ellipse fitting
+                if len(points) > 1000:
+                    # Subsample for efficiency
+                    indices = np.random.choice(len(points), 1000, replace=False)
+                    sample_points = points[indices]
+                else:
+                    sample_points = points
+                
+                # Fit ellipse using OpenCV
+                contour = sample_points.reshape(-1, 1, 2).astype(np.int32)
+                ellipse = cv2.fitEllipse(contour)
+                (cx, cy), (MA, ma), angle = ellipse
+                
+                # Check if center is within frame boundary
+                if not (0 <= cx < W and 0 <= cy < H):
+                    print(f"  Trial {i+1}: Ellipse center outside frame, skipping")
+                    continue
+                
+                # Add margin to axes
+                MA = MA + 2 * auto_scale_margin
+                ma = ma + 2 * auto_scale_margin
+                
+                # Semi-axes
+                a = MA / 2
+                b = ma / 2
+                angle_rad = np.deg2rad(angle)
+                
+                # Calculate coverage: transform points to ellipse coordinate system
+                xp = all_xs - cx
+                yp = all_ys - cy
+                xr = xp * np.cos(angle_rad) + yp * np.sin(angle_rad)
+                yr = -xp * np.sin(angle_rad) + yp * np.cos(angle_rad)
+                
+                # Check if points are inside ellipse
+                inside = (xr**2 / a**2 + yr**2 / b**2) <= 1
+                points_inside = np.sum(inside)
+                coverage_ratio = points_inside / total_interest_points if total_interest_points > 0 else 0
+                
+                print(f"  Trial {i+1}: center=({cx:.1f}, {cy:.1f}), axes=({a:.1f}, {b:.1f}), "
+                      f"angle={angle:.1f}°, coverage={points_inside}/{total_interest_points} ({coverage_ratio:.3f})")
+
+                if coverage_ratio > best_ellipse_coverage:
+                    best_ellipse_coverage = coverage_ratio
+                    best_ellipse = ((cx, cy), (MA, ma), angle)
+                
+            except Exception as e:
+                print(f"  Trial {i+1} failed: {e}")
+                continue
+    else:
+        print("  Insufficient points for ellipse fitting")
+
+    # ========== COMPARE AND CHOOSE ==========
+    print("\n  === COMPARISON ===")
+    
+    # Calculate scores: high coverage + small size = better score
+    # Score = coverage / normalized_size
+    # This rewards tight-fitting shapes that capture the data efficiently
+    
+    circle_score = 0
+    ellipse_score = 0
+    
+    if best_circle is not None:
+        xc, yc, r = best_circle
+        # Normalize radius by max possible radius
+        normalized_circle_size = r / max_possible_radius
+        # Score: coverage divided by size (higher coverage and smaller size = better)
+        circle_score = best_circle_coverage / (normalized_circle_size + 0.3)  # +0.1 to avoid division by zero
+        print(f"  Circle: coverage={best_circle_coverage:.3f}, radius={r:.1f}, "
+              f"norm_size={normalized_circle_size:.3f}, score={circle_score:.3f}")
+    else:
+        print(f"  Circle: No valid fit")
+    
+    if best_ellipse is not None:
+        (cx, cy), (MA, ma), angle = best_ellipse
+        # Normalize ellipse size by average of semi-axes
+        avg_axis = (MA/2 + ma/2) / 2
+        normalized_ellipse_size = avg_axis / max_possible_radius
+        # Score: coverage divided by size
+        ellipse_score = best_ellipse_coverage / (normalized_ellipse_size + 0.3)
+        print(f"  Ellipse: coverage={best_ellipse_coverage:.3f}, avg_axis={avg_axis:.1f}, "
+              f"norm_size={normalized_ellipse_size:.3f}, score={ellipse_score:.3f}")
+    else:
+        print(f"  Ellipse: No valid fit")
+    
+    final_mask = np.zeros((H, W), dtype=np.uint8)
+    shape_type = None
+    
+    if best_circle is None and best_ellipse is None:
+        print("  No valid shapes found, returning ocean mask")
+        return ocean_mask, edges, "none"
+    elif best_circle is None:
+        print("  → Chose ELLIPSE (only valid option)")
+        (cx, cy), (MA, ma), angle = best_ellipse
+        cv2.ellipse(final_mask, best_ellipse, 255, -1)
+        shape_type = "ellipse"
+        print(f"  Final: center=({cx:.1f}, {cy:.1f}), axes=({MA/2:.1f}, {ma/2:.1f}), angle={angle:.1f}°")
+    elif best_ellipse is None:
+        print("  → Chose CIRCLE (only valid option)")
+        xc, yc, r = best_circle
         Y, X = np.ogrid[:H, :W]
         final_mask = ((X - xc)**2 + (Y - yc)**2 <= r*r).astype(np.uint8) * 255
-        center = circle_center
+        shape_type = "circle"
+        print(f"  Final: center=({xc:.1f}, {yc:.1f}), radius={r:.1f}")
+    elif ellipse_score > circle_score and best_ellipse_coverage > 0.9:
+        print(f"  → Chose ELLIPSE (better score: {ellipse_score:.3f} > {circle_score:.3f})")
+        (cx, cy), (MA, ma), angle = best_ellipse
+        cv2.ellipse(final_mask, best_ellipse, 255, -1)
+        shape_type = "ellipse"
+        print(f"  Final: center=({cx:.1f}, {cy:.1f}), axes=({MA/2:.1f}, {ma/2:.1f}), angle={angle:.1f}°")
+    else:
+        print(f"  → Chose CIRCLE (better score: {circle_score:.3f} >= {ellipse_score:.3f})")
+        xc, yc, r = best_circle
+        Y, X = np.ogrid[:H, :W]
+        final_mask = ((X - xc)**2 + (Y - yc)**2 <= r*r).astype(np.uint8) * 255
+        shape_type = "circle"
+        print(f"  Final: center=({xc:.1f}, {yc:.1f}), radius={r:.1f}")
     
-    return final_mask, center
-
+    return final_mask, edges, shape_type
 
 # EVALUATION
 
@@ -175,7 +351,7 @@ def test_on_single_image(image_path, ground_truth_path=None, save_prefix='result
 
 
     print("Applying Method 3: Combined")
-    mask3, center = color_then_circle(image)
+    mask3, _,_ = color_then_circle_or_ellipse(image)
 
     # Load ground truth
     ground_truth = None
@@ -241,7 +417,7 @@ def test_on_single_image(image_path, ground_truth_path=None, save_prefix='result
     print(f"\nVisualization saved to {save_path}")
     plt.show()
 
-    return mask3,center
+    return mask3
     
 
 
@@ -249,16 +425,16 @@ def test_on_single_image(image_path, ground_truth_path=None, save_prefix='result
 if __name__ == "__main__":
     
     
-    img_dir = "final_dataset/Easy/images"
-    mask_dir = "final_dataset/Easy/masks"
+    img_dir = "final_dataset_small/Easy/images"
+    mask_dir = "final_dataset_small/Easy/masks"
 
     image_files = sorted(glob.glob(os.path.join(img_dir, "*.png")))
     mask_files = sorted(glob.glob(os.path.join(mask_dir, "*.png")))
 
     for i in range(len(image_files)):
 
-            mask3, center = test_on_single_image(image_files[i], mask_files[i], save_prefix=image_files[i][-10:])
-            print(center)
+            mask3 = test_on_single_image(image_files[i], mask_files[i], save_prefix=image_files[i][-10:])
+
         # Generate individual ROC curves for each method
     
     print(" TEST COMPLETED!")

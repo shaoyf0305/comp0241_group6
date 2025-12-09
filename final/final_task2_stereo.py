@@ -3,6 +3,8 @@ import cv2
 import matplotlib.pyplot as plt
 from skimage.measure import CircleModel, ransac
 
+from scipy.interpolate import griddata
+
 # task2 height from stereo pics framework
 # need better center measurement strategy
 # apply:case_all_circle
@@ -14,12 +16,12 @@ class StereoHeightEstimator:
     Uses triangulation with known baseline distance between two cameras.
     """
     
-    def __init__(self, baseline_cm=73, focal_length_px=None):
+    def __init__(self, baseline_cm=120, focal_length_px=None):
         """
         Initialize the stereo height estimator.
         
         Args:
-            baseline_cm: Distance between the two cameras in centimeters (default: 73cm)
+            baseline_cm: Distance between the two cameras in centimeters (default: 120cm)
             focal_length_px: Focal length in pixels (can be estimated from images)
         """
         self.baseline_cm = baseline_cm
@@ -428,19 +430,21 @@ class StereoHeightEstimator:
         
         return results
     
+
+
     def visualize_results(self, img_left, img_right, pts_left, pts_right,
-                         center_left, center_right, radius_left,
-                         matches, kp_left, kp_right, height_cm):
+                                center_left, center_right, radius_left,
+                                matches, kp_left, kp_right, height_cm):
         """
-        Visualize the stereo matching and height estimation results.
+        Visualize the stereo matching and height estimation results with improved disparity map.
         """
         fig = plt.figure(figsize=(16, 10))
         
         # 1. Matched features
         ax1 = plt.subplot(2, 2, 1)
         img_matches = cv2.drawMatches(img_left, kp_left, img_right, kp_right,
-                                     matches[:50], None,  # Show first 50 matches
-                                     flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+                                    matches[:50], None,
+                                    flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
         ax1.imshow(cv2.cvtColor(img_matches, cv2.COLOR_BGR2RGB))
         ax1.set_title('Feature Matches (showing 50)', fontsize=12, fontweight='bold')
         ax1.axis('off')
@@ -449,7 +453,7 @@ class StereoHeightEstimator:
         ax2 = plt.subplot(2, 2, 2)
         overlay_left = img_left.copy()
         cv2.circle(overlay_left, tuple(center_left.astype(int)), int(radius_left), 
-                  (0, 255, 0), 3)
+                (0, 255, 0), 3)
         cv2.circle(overlay_left, tuple(center_left.astype(int)), 5, (255, 0, 0), -1)
         ax2.imshow(cv2.cvtColor(overlay_left, cv2.COLOR_BGR2RGB))
         ax2.set_title('Left Image - AO Detection', fontsize=12, fontweight='bold')
@@ -459,32 +463,166 @@ class StereoHeightEstimator:
         ax3 = plt.subplot(2, 2, 3)
         overlay_right = img_right.copy()
         cv2.circle(overlay_right, tuple(center_right.astype(int)), int(radius_left), 
-                  (0, 255, 0), 3)
+                (0, 255, 0), 3)
         cv2.circle(overlay_right, tuple(center_right.astype(int)), 5, (255, 0, 0), -1)
         ax3.imshow(cv2.cvtColor(overlay_right, cv2.COLOR_BGR2RGB))
         ax3.set_title('Right Image - AO Detection', fontsize=12, fontweight='bold')
         ax3.axis('off')
         
-        # 4. Disparity visualization
+        # 4. IMPROVED Disparity visualization
         ax4 = plt.subplot(2, 2, 4)
-        # Create simple disparity map visualization
-        disparity_map = np.zeros(img_left.shape[:2])
-        for pt_l, pt_r in zip(pts_left, pts_right):
-            x, y = int(pt_l[0]), int(pt_l[1])
-            if 0 <= x < disparity_map.shape[1] and 0 <= y < disparity_map.shape[0]:
-                disparity_map[y, x] = pt_l[0] - pt_r[0]
         
-        im = ax4.imshow(disparity_map, cmap='jet')
-        ax4.set_title(f'Disparity Map\nEstimated Height: {height_cm:.1f} cm', 
-                     fontsize=12, fontweight='bold')
+        # Calculate disparities for all matched points
+        disparities = pts_left[:, 0] - pts_right[:, 0]
+        
+        # Filter valid disparities (remove outliers)
+        valid_mask = (disparities > 0) & (disparities < 200)  # Adjust threshold as needed
+        valid_pts = pts_left[valid_mask]
+        valid_disp = disparities[valid_mask]
+        
+        if len(valid_disp) > 10:
+            # Create interpolated disparity map
+            h, w = img_left.shape[:2]
+            
+            # Create grid for interpolation
+            grid_x, grid_y = np.meshgrid(np.arange(w), np.arange(h))
+            
+            # Interpolate disparity values across the image
+            # Using 'nearest' for speed, or 'linear'/'cubic' for smoother results
+            disparity_map = griddata(
+                points=valid_pts,
+                values=valid_disp,
+                xi=(grid_x, grid_y),
+                method='nearest',  # Try 'linear' or 'cubic' for smoother results
+                fill_value=0
+            )
+            
+            # Optional: Apply Gaussian blur for smoother visualization
+            disparity_map = cv2.GaussianBlur(disparity_map.astype(np.float32), (15, 15), 0)
+            
+            # Display with better colormap and range
+            vmin, vmax = np.percentile(valid_disp, [5, 95])  # Use percentiles to avoid outliers
+            im = ax4.imshow(disparity_map, cmap='jet', vmin=vmin, vmax=vmax)
+            
+            # Overlay matched points
+            ax4.scatter(valid_pts[:, 0], valid_pts[:, 1], c='white', s=1, alpha=0.3)
+            
+        else:
+            # Fallback: show sparse disparity
+            disparity_map = np.zeros(img_left.shape[:2])
+            for pt, disp in zip(valid_pts, valid_disp):
+                x, y = int(pt[0]), int(pt[1])
+                if 0 <= x < w and 0 <= y < h:
+                    disparity_map[y, x] = disp
+            im = ax4.imshow(disparity_map, cmap='jet')
+        
+        ax4.set_title(f'Disparity Map (Interpolated)\nEstimated Height: {height_cm:.1f} cm', 
+                    fontsize=12, fontweight='bold')
         ax4.axis('off')
-        plt.colorbar(im, ax=ax4, label='Disparity (pixels)')
+        cbar = plt.colorbar(im, ax=ax4, label='Disparity (pixels)')
+        
+        # Add depth scale annotation
+        if len(valid_disp) > 0:
+            focal_length = self.focal_length_px
+            baseline = self.baseline_cm
+            depth_min = (focal_length * baseline) / vmax if vmax > 0 else 0
+            depth_max = (focal_length * baseline) / vmin if vmin > 0 else 0
+            ax4.text(0.02, 0.98, f'Depth: {depth_min:.0f}-{depth_max:.0f} cm', 
+                    transform=ax4.transAxes, fontsize=9, verticalalignment='top',
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
         
         plt.tight_layout()
         plt.savefig('stereo_height_estimation.png', dpi=150, bbox_inches='tight')
         print("\nVisualization saved to: stereo_height_estimation.png")
         plt.show()
 
+
+# Alternative: Dense stereo matching using OpenCV's StereoSGBM
+def create_dense_disparity_map(img_left, img_right):
+    """
+    Create a dense disparity map using Semi-Global Block Matching.
+    This provides disparity values for most pixels, not just feature matches.
+    """
+    # Convert to grayscale
+    gray_left = cv2.cvtColor(img_left, cv2.COLOR_BGR2GRAY)
+    gray_right = cv2.cvtColor(img_right, cv2.COLOR_BGR2GRAY)
+    
+    # Create StereoSGBM object
+    window_size = 5
+    min_disp = 0
+    num_disp = 16 * 10  # Must be divisible by 16
+    
+    stereo = cv2.StereoSGBM_create(
+        minDisparity=min_disp,
+        numDisparities=num_disp,
+        blockSize=window_size,
+        P1=8 * 3 * window_size ** 2,
+        P2=32 * 3 * window_size ** 2,
+        disp12MaxDiff=1,
+        uniquenessRatio=10,
+        speckleWindowSize=100,
+        speckleRange=32,
+        mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY
+    )
+    
+    # Compute disparity
+    disparity = stereo.compute(gray_left, gray_right).astype(np.float32) / 16.0
+    
+    # Filter invalid disparities
+    disparity[disparity <= 0] = np.nan
+    
+    return disparity
+
+
+# Example usage in visualization:
+def visualize_with_dense_disparity(self, img_left, img_right, pts_left, pts_right,
+                                center_left, center_right, radius_left,
+                                matches, kp_left, kp_right, height_cm):
+    """
+    Visualization using dense stereo matching for better disparity map.
+    """
+    fig = plt.figure(figsize=(16, 10))
+    
+    # Subplots 1-3 same as before...
+    ax1 = plt.subplot(2, 2, 1)
+    img_matches = cv2.drawMatches(img_left, kp_left, img_right, kp_right,
+                                matches[:50], None,
+                                flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+    ax1.imshow(cv2.cvtColor(img_matches, cv2.COLOR_BGR2RGB))
+    ax1.set_title('Feature Matches', fontsize=12, fontweight='bold')
+    ax1.axis('off')
+    
+    ax2 = plt.subplot(2, 2, 2)
+    overlay_left = img_left.copy()
+    cv2.circle(overlay_left, tuple(center_left.astype(int)), int(radius_left), 
+            (0, 255, 0), 3)
+    ax2.imshow(cv2.cvtColor(overlay_left, cv2.COLOR_BGR2RGB))
+    ax2.set_title('Left Image', fontsize=12, fontweight='bold')
+    ax2.axis('off')
+    
+    ax3 = plt.subplot(2, 2, 3)
+    overlay_right = img_right.copy()
+    cv2.circle(overlay_right, tuple(center_right.astype(int)), int(radius_left), 
+            (0, 255, 0), 3)
+    ax3.imshow(cv2.cvtColor(overlay_right, cv2.COLOR_BGR2RGB))
+    ax3.set_title('Right Image', fontsize=12, fontweight='bold')
+    ax3.axis('off')
+    
+    # 4. Dense disparity map
+    ax4 = plt.subplot(2, 2, 4)
+    print("  Computing dense disparity map...")
+    disparity_map = create_dense_disparity_map(img_left, img_right)
+    
+    im = ax4.imshow(disparity_map, cmap='jet')
+    ax4.set_title(f'Dense Disparity Map\nEstimated Height: {height_cm:.1f} cm', 
+                fontsize=12, fontweight='bold')
+    ax4.axis('off')
+    plt.colorbar(im, ax=ax4, label='Disparity (pixels)')
+    
+    plt.tight_layout()
+    plt.savefig('stereo_height_estimation.png', dpi=150, bbox_inches='tight')
+    print("\nVisualization saved to: stereo_height_estimation.png")
+    plt.show()
 
 # USAGE EXAMPLE
 if __name__ == "__main__":
@@ -525,14 +663,14 @@ if __name__ == "__main__":
             print("="*70)
 
 
-# Initialize with your 73cm baseline
-estimator = StereoHeightEstimator(baseline_cm=73)
+# Initialize with your baseline
+estimator = StereoHeightEstimator(baseline_cm=120)
 
 # Load your stereo pair
 img_left = cv2.imread('task2_stereo/left_camera.jpg')
 img_right = cv2.imread('task2_stereo/right_camera.jpg')
 
 # Estimate height with validation
-results = estimator.estimate_height_from_stereo(img_left, img_right)
+results = estimator.estimate_height_from_stereo(img_left, img_right) # true=20.4m
 
 print(f"Height: {results['height_cm']:.1f} cm")

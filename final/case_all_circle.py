@@ -403,11 +403,12 @@ def test_on_single_image(image_path, ground_truth_path=None, save_prefix='result
 if __name__ == "__main__":
 
     # print(" TESTING ON 000000.png")
-    test_image = "final_dataset/Test/images/000006.jpg"
-    # test_image = "final_dataset/Test/images/000016.png"
+    # test_image = "final_dataset/Test/images/000006.jpg"
+    # test_mask = "final_dataset/Test/masks/000006.jpg"
 
-    test_mask = "final_dataset/Test/masks/000006.jpg"
-    # test_mask = "final_dataset/Easy/masks/000016.png"
+
+    test_image = "final_dataset/Easy/images/000075.png"
+    test_mask = "final_dataset/Easy/masks/000075.png"
 
     if os.path.exists(test_image):
         # You can adjust parameters:
